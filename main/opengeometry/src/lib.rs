@@ -26,6 +26,7 @@ pub mod primitives {
     pub mod curve;
     pub mod cylinder;
     pub mod elliptical_arc;
+    pub mod frustum;
     pub mod line;
     pub mod polygon;
     pub mod polyline;
