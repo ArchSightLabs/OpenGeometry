@@ -3,8 +3,8 @@ name = "opengeometry"
 version = "1.0.9"
 authors = ["Vishwajeet Mane <manevishwajeet1@gmail.com>"]
 description = "Graphics Kernel for Next Gen"
-license = "MIT/Apache-2.0"
-repository = "https://github.com/OpenGeometry-io/OpenGeometry"
+license-file = "../../LICENSE.md"
+repository = "https://github.com/ArchSightLabs/OpenGeometry"
 edition = "2021"
 
 [lib]
