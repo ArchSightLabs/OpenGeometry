@@ -1,4 +1,5 @@
 use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashSet};
 
 use openmaths::Vector3;
 use serde::{Deserialize, Serialize};
@@ -108,6 +109,13 @@ impl Aabb3 {
             && self.max.y >= other.min.y
             && self.min.z <= other.max.z
             && self.max.z >= other.min.z
+    }
+
+    pub fn distance_squared_to_aabb(&self, other: &Self) -> f64 {
+        let gap_x = axis_gap(self.min.x, self.max.x, other.min.x, other.max.x);
+        let gap_y = axis_gap(self.min.y, self.max.y, other.min.y, other.max.y);
+        let gap_z = axis_gap(self.min.z, self.max.z, other.min.z, other.max.z);
+        gap_x * gap_x + gap_y * gap_y + gap_z * gap_z
     }
 
     pub fn intersects_frustum(&self, frustum: &Frustum3) -> bool {
@@ -286,6 +294,12 @@ pub struct RayHit {
     pub distance: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BvhPairTraversalStats {
+    pub node_pair_tests: usize,
+    pub primitive_pair_tests: usize,
+}
+
 pub struct Bvh3 {
     primitives: Vec<BvhPrimitive>,
     indices: Vec<usize>,
@@ -322,6 +336,149 @@ impl Bvh3 {
 
     pub fn query_frustum(&self, frustum: &Frustum3) -> Vec<u32> {
         self.query(|candidate| candidate.intersects_frustum(frustum))
+    }
+
+    pub fn query_pairs_within_distance(
+        &self,
+        max_distance: f64,
+        max_pairs: usize,
+    ) -> Result<Vec<(u32, u32)>, String> {
+        if !max_distance.is_finite() || max_distance < 0.0 {
+            return Err(
+                "Invalid spatial pair query: max distance must be finite and non-negative."
+                    .to_string(),
+            );
+        }
+        if max_pairs == 0 {
+            return Err(
+                "Invalid spatial pair query: max pairs must be greater than zero.".to_string(),
+            );
+        }
+        let max_distance_sq = max_distance * max_distance;
+        if !max_distance_sq.is_finite() {
+            return Err("Invalid spatial pair query: max distance is too large.".to_string());
+        }
+
+        let mut ids = HashSet::with_capacity(self.primitives.len());
+        if self
+            .primitives
+            .iter()
+            .any(|primitive| !ids.insert(primitive.id))
+        {
+            return Err("Invalid spatial pair query: primitive ids must be unique.".to_string());
+        }
+
+        let mut pairs = Vec::new();
+        for primitive in &self.primitives {
+            for candidate_id in self.query(|candidate| {
+                primitive.bounds.distance_squared_to_aabb(candidate) <= max_distance_sq
+            }) {
+                if primitive.id >= candidate_id {
+                    continue;
+                }
+                if pairs.len() == max_pairs {
+                    return Err(format!(
+                        "Spatial pair query exceeded max pairs limit: {}.",
+                        max_pairs
+                    ));
+                }
+                pairs.push((primitive.id, candidate_id));
+            }
+        }
+        pairs.sort_unstable();
+        pairs.dedup();
+        Ok(pairs)
+    }
+
+    pub fn visit_nearest_pairs<F>(
+        &self,
+        other: &Self,
+        mut best_distance_sq: f64,
+        mut visit: F,
+    ) -> (f64, BvhPairTraversalStats)
+    where
+        F: FnMut(u32, u32) -> f64,
+    {
+        let mut stats = BvhPairTraversalStats::default();
+        if self.nodes.is_empty() || other.nodes.is_empty() {
+            return (best_distance_sq, stats);
+        }
+
+        let mut queue = BinaryHeap::new();
+        queue.push(NodePairQueueEntry::new(0, 0, &self.nodes, &other.nodes));
+
+        while let Some(entry) = queue.pop() {
+            stats.node_pair_tests += 1;
+            if entry.distance_sq > best_distance_sq {
+                continue;
+            }
+            let left_node = &self.nodes[entry.left_node];
+            let right_node = &other.nodes[entry.right_node];
+            if left_node.is_leaf() && right_node.is_leaf() {
+                for left_index in &self.indices[left_node.start..left_node.end] {
+                    let left = &self.primitives[*left_index];
+                    for right_index in &other.indices[right_node.start..right_node.end] {
+                        let right = &other.primitives[*right_index];
+                        if left.bounds.distance_squared_to_aabb(&right.bounds) > best_distance_sq {
+                            continue;
+                        }
+                        stats.primitive_pair_tests += 1;
+                        let candidate = visit(left.id, right.id);
+                        if candidate.is_finite() && candidate < best_distance_sq {
+                            best_distance_sq = candidate;
+                        }
+                    }
+                }
+                if best_distance_sq == 0.0 {
+                    break;
+                }
+                continue;
+            }
+
+            match (left_node.is_leaf(), right_node.is_leaf()) {
+                (true, false) => {
+                    push_node_pair_children(
+                        &mut queue,
+                        entry.left_node,
+                        right_node,
+                        true,
+                        &self.nodes,
+                        &other.nodes,
+                        best_distance_sq,
+                    );
+                }
+                (false, true) => {
+                    push_node_pair_children(
+                        &mut queue,
+                        entry.right_node,
+                        left_node,
+                        false,
+                        &self.nodes,
+                        &other.nodes,
+                        best_distance_sq,
+                    );
+                }
+                (false, false) => {
+                    for left_child in [left_node.left, left_node.right].into_iter().flatten() {
+                        for right_child in [right_node.left, right_node.right].into_iter().flatten()
+                        {
+                            let child = NodePairQueueEntry::new(
+                                left_child,
+                                right_child,
+                                &self.nodes,
+                                &other.nodes,
+                            );
+                            if child.distance_sq <= best_distance_sq {
+                                queue.push(child);
+                            }
+                        }
+                    }
+                }
+                (true, true) => unreachable!(),
+            }
+        }
+
+        (best_distance_sq, stats)
     }
 
     pub fn raycast_first(&self, ray: &Ray3) -> Option<RayHit> {
@@ -495,6 +652,22 @@ impl OGSpatialIndex {
         Ok(self.bvh.query_aabb(&bounds))
     }
 
+    #[wasm_bindgen(js_name = queryPairIdsWithinDistance)]
+    pub fn query_pair_ids_within_distance(
+        &self,
+        max_distance: f64,
+        max_pairs: u32,
+    ) -> Result<Vec<u32>, JsValue> {
+        let pairs = self
+            .bvh
+            .query_pairs_within_distance(max_distance, max_pairs as usize)
+            .map_err(|err| JsValue::from_str(&err))?;
+        Ok(pairs
+            .into_iter()
+            .flat_map(|(left, right)| [left, right])
+            .collect())
+    }
+
     #[wasm_bindgen(js_name = queryFrustum)]
     pub fn query_frustum(&self, planes_json: String) -> Result<String, JsValue> {
         let frustum = parse_frustum_json(&planes_json).map_err(|err| JsValue::from_str(&err))?;
@@ -555,6 +728,78 @@ struct BvhNode {
 impl BvhNode {
     fn is_leaf(&self) -> bool {
         self.left.is_none() && self.right.is_none()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct NodePairQueueEntry {
+    left_node: usize,
+    right_node: usize,
+    distance_sq: f64,
+}
+
+impl NodePairQueueEntry {
+    fn new(
+        left_node: usize,
+        right_node: usize,
+        left_nodes: &[BvhNode],
+        right_nodes: &[BvhNode],
+    ) -> Self {
+        Self {
+            left_node,
+            right_node,
+            distance_sq: left_nodes[left_node]
+                .bounds
+                .distance_squared_to_aabb(&right_nodes[right_node].bounds),
+        }
+    }
+}
+
+impl PartialEq for NodePairQueueEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.left_node == other.left_node
+            && self.right_node == other.right_node
+            && self.distance_sq.to_bits() == other.distance_sq.to_bits()
+    }
+}
+
+impl Eq for NodePairQueueEntry {}
+
+impl PartialOrd for NodePairQueueEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for NodePairQueueEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .distance_sq
+            .total_cmp(&self.distance_sq)
+            .then_with(|| other.left_node.cmp(&self.left_node))
+            .then_with(|| other.right_node.cmp(&self.right_node))
+    }
+}
+
+fn push_node_pair_children(
+    queue: &mut BinaryHeap<NodePairQueueEntry>,
+    fixed_node: usize,
+    split_node: &BvhNode,
+    split_is_right: bool,
+    left_nodes: &[BvhNode],
+    right_nodes: &[BvhNode],
+    best_distance_sq: f64,
+) {
+    for child in [split_node.left, split_node.right].into_iter().flatten() {
+        let (left_node, right_node) = if split_is_right {
+            (fixed_node, child)
+        } else {
+            (child, fixed_node)
+        };
+        let entry = NodePairQueueEntry::new(left_node, right_node, left_nodes, right_nodes);
+        if entry.distance_sq <= best_distance_sq {
+            queue.push(entry);
+        }
     }
 }
 
@@ -698,6 +943,16 @@ fn update_ray_interval(
     (*t_min <= *t_max).then_some(())
 }
 
+fn axis_gap(left_min: f64, left_max: f64, right_min: f64, right_max: f64) -> f64 {
+    if left_max < right_min {
+        right_min - left_max
+    } else if right_max < left_min {
+        left_min - right_max
+    } else {
+        0.0
+    }
+}
+
 fn validate_vector3(vector: Vector3, label: &str) -> Result<(), String> {
     if vector.x.is_finite() && vector.y.is_finite() && vector.z.is_finite() {
         Ok(())
@@ -752,6 +1007,90 @@ mod tests {
             .expect("empty is valid")
             .is_none());
         assert!(Aabb3::from_flat_vertices(&[1.0, 2.0]).is_err());
+    }
+
+    #[test]
+    fn aabb_distance_uses_euclidean_axis_gaps() {
+        let left = Aabb3::from_coords(0.0, 0.0, 0.0, 1.0, 1.0, 1.0).expect("left");
+        let touching = Aabb3::from_coords(1.0, -2.0, 0.0, 2.0, -1.0, 1.0).expect("touching");
+        let diagonal = Aabb3::from_coords(2.0, 3.0, 1.0, 4.0, 5.0, 2.0).expect("diagonal");
+
+        assert_eq!(left.distance_squared_to_aabb(&touching), 1.0);
+        assert_eq!(left.distance_squared_to_aabb(&diagonal), 5.0);
+        assert_eq!(left.distance_squared_to_aabb(&left), 0.0);
+    }
+
+    #[test]
+    fn bvh_pair_query_is_unique_sorted_thresholded_and_capped() {
+        let bvh = Bvh3::build(vec![
+            box_primitive(30, (4.0, 0.0, 0.0), (5.0, 1.0, 1.0)),
+            box_primitive(10, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+            box_primitive(20, (2.0, 0.0, 0.0), (3.0, 1.0, 1.0)),
+        ]);
+
+        assert_eq!(
+            bvh.query_pairs_within_distance(1.0, 10)
+                .expect("pairs at threshold"),
+            vec![(10, 20), (20, 30)]
+        );
+        assert_eq!(
+            bvh.query_pairs_within_distance(0.999, 10)
+                .expect("pairs below threshold"),
+            Vec::<(u32, u32)>::new()
+        );
+        assert!(bvh.query_pairs_within_distance(-1.0, 10).is_err());
+        assert!(bvh.query_pairs_within_distance(f64::NAN, 10).is_err());
+        assert!(bvh.query_pairs_within_distance(1.0, 0).is_err());
+
+        let dense = Bvh3::build(vec![
+            box_primitive(1, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+            box_primitive(2, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+            box_primitive(3, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+        ]);
+        assert!(dense.query_pairs_within_distance(0.0, 2).is_err());
+
+        let duplicate = Bvh3::build(vec![
+            box_primitive(7, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+            box_primitive(7, (2.0, 0.0, 0.0), (3.0, 1.0, 1.0)),
+        ]);
+        assert!(duplicate.query_pairs_within_distance(10.0, 10).is_err());
+    }
+
+    #[test]
+    fn nearest_pair_traversal_matches_bruteforce_and_prunes_far_pairs() {
+        let left_primitives = (0..64)
+            .map(|index| {
+                let x = index as f64 * 100.0;
+                box_primitive(index, (x, 0.0, 0.0), (x + 1.0, 1.0, 1.0))
+            })
+            .collect::<Vec<_>>();
+        let right_primitives = (0..64)
+            .map(|index| {
+                let x = index as f64 * 100.0 + 2.0;
+                box_primitive(index, (x, 0.0, 0.0), (x + 1.0, 1.0, 1.0))
+            })
+            .collect::<Vec<_>>();
+        let brute_force = left_primitives
+            .iter()
+            .flat_map(|left| {
+                right_primitives
+                    .iter()
+                    .map(move |right| left.bounds.distance_squared_to_aabb(&right.bounds))
+            })
+            .fold(f64::INFINITY, f64::min);
+        let left = Bvh3::build(left_primitives.clone());
+        let right = Bvh3::build(right_primitives.clone());
+
+        let (best, stats) = left.visit_nearest_pairs(&right, f64::INFINITY, |left_id, right_id| {
+            left_primitives[left_id as usize]
+                .bounds
+                .distance_squared_to_aabb(&right_primitives[right_id as usize].bounds)
+        });
+
+        assert_eq!(best, brute_force);
+        assert!(stats.node_pair_tests > 0);
+        assert!(stats.primitive_pair_tests > 0);
+        assert!(stats.primitive_pair_tests < 64 * 64);
     }
 
     #[test]
@@ -910,6 +1249,12 @@ mod tests {
             .query_aabb(0.0, 0.0, 0.0, 4.0, 4.0, 4.0)
             .expect("query ids");
         assert_eq!(ids, "[2]");
+        assert_eq!(
+            index
+                .query_pair_ids_within_distance(3.5, 10)
+                .expect("pair ids"),
+            vec![1, 2, 2, 3]
+        );
 
         let frustum_json = r#"[
             {"normal": [1, 0, 0], "constant": 0},

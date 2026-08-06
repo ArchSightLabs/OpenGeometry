@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 
 use crate::operations::triangulate::triangulate_polygon_with_holes;
+use crate::spatial::bvh::{Aabb3, Bvh3, BvhPairTraversalStats, BvhPrimitive};
 use crate::spatial::placement::Placement3D;
 
 use super::{Brep, CurveGeometry, SurfaceGeometry};
@@ -75,6 +76,12 @@ enum ProximitySource {
     Containment,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProximityAcceleration {
+    TriangleBvhV1,
+}
+
 type JsonPoint = [f64; 3];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -90,6 +97,9 @@ struct BrepProximityReport {
     source: ProximitySource,
     lhs_triangle_count: usize,
     rhs_triangle_count: usize,
+    acceleration: ProximityAcceleration,
+    bvh_node_pair_tests: usize,
+    triangle_pair_tests: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -113,9 +123,9 @@ struct TriangleRecord {
     c: Vector3,
 }
 
-#[derive(Clone)]
 struct PreparedBrep {
     triangles: Vec<TriangleRecord>,
+    triangle_bvh: Bvh3,
     vertices: Vec<Vector3>,
     bbox: BoundingBox,
     accuracy: ProximityAccuracy,
@@ -363,13 +373,41 @@ fn prepare_brep(brep: &Brep) -> Result<PreparedBrep, JsValue> {
     } else {
         ProximityAccuracy::ExactPlanarBrep
     };
+    let triangle_bvh = build_triangle_bvh(&triangles)?;
 
     Ok(PreparedBrep {
         triangles,
+        triangle_bvh,
         vertices,
         bbox,
         accuracy,
     })
+}
+
+fn build_triangle_bvh(triangles: &[TriangleRecord]) -> Result<Bvh3, JsValue> {
+    let primitives = triangles
+        .iter()
+        .enumerate()
+        .map(|(index, triangle)| {
+            let id = u32::try_from(index).map_err(|_| {
+                js_error("BRep proximity rejected: triangle count exceeds spatial index capacity")
+            })?;
+            let min = Vector3::new(
+                triangle.a.x.min(triangle.b.x).min(triangle.c.x),
+                triangle.a.y.min(triangle.b.y).min(triangle.c.y),
+                triangle.a.z.min(triangle.b.z).min(triangle.c.z),
+            );
+            let max = Vector3::new(
+                triangle.a.x.max(triangle.b.x).max(triangle.c.x),
+                triangle.a.y.max(triangle.b.y).max(triangle.c.y),
+                triangle.a.z.max(triangle.b.z).max(triangle.c.z),
+            );
+            let bounds = Aabb3::new(min, max)
+                .map_err(|error| js_error(format!("Invalid triangle bounds: {error}")))?;
+            Ok(BvhPrimitive::new(id, bounds))
+        })
+        .collect::<Result<Vec<_>, JsValue>>()?;
+    Ok(Bvh3::build(primitives))
 }
 
 fn ensure_brep_geometry_finite(brep: &Brep) -> Result<(), JsValue> {
@@ -418,7 +456,7 @@ fn compare_prepared_breps(lhs: &PreparedBrep, rhs: &PreparedBrep) -> BrepProximi
     // One boundary traversal supplies both the contact decision and the
     // separated witness. Repeating the O(lhs_triangles * rhs_triangles)
     // traversal would double the dominant cost for ordinary separated solids.
-    let boundary_witness = triangle_distance(lhs, rhs);
+    let (boundary_witness, traversal_stats) = triangle_distance(lhs, rhs);
     if boundary_witness.distance_sq <= tolerance * tolerance {
         return BrepProximityReport {
             schema: PAIR_SCHEMA.to_string(),
@@ -432,6 +470,9 @@ fn compare_prepared_breps(lhs: &PreparedBrep, rhs: &PreparedBrep) -> BrepProximi
             source: ProximitySource::BoundaryContact,
             lhs_triangle_count: lhs.triangles.len(),
             rhs_triangle_count: rhs.triangles.len(),
+            acceleration: ProximityAcceleration::TriangleBvhV1,
+            bvh_node_pair_tests: traversal_stats.node_pair_tests,
+            triangle_pair_tests: traversal_stats.primitive_pair_tests,
         };
     }
 
@@ -453,6 +494,9 @@ fn compare_prepared_breps(lhs: &PreparedBrep, rhs: &PreparedBrep) -> BrepProximi
             source: ProximitySource::Containment,
             lhs_triangle_count: lhs.triangles.len(),
             rhs_triangle_count: rhs.triangles.len(),
+            acceleration: ProximityAcceleration::TriangleBvhV1,
+            bvh_node_pair_tests: traversal_stats.node_pair_tests,
+            triangle_pair_tests: traversal_stats.primitive_pair_tests,
         };
     }
 
@@ -468,6 +512,9 @@ fn compare_prepared_breps(lhs: &PreparedBrep, rhs: &PreparedBrep) -> BrepProximi
         source: ProximitySource::BoundaryDistance,
         lhs_triangle_count: lhs.triangles.len(),
         rhs_triangle_count: rhs.triangles.len(),
+        acceleration: ProximityAcceleration::TriangleBvhV1,
+        bvh_node_pair_tests: traversal_stats.node_pair_tests,
+        triangle_pair_tests: traversal_stats.primitive_pair_tests,
     }
 }
 
@@ -522,7 +569,10 @@ fn compare_prepared_brep_to_point(
     }
 }
 
-fn triangle_distance(lhs: &PreparedBrep, rhs: &PreparedBrep) -> ContactWitness {
+fn triangle_distance(
+    lhs: &PreparedBrep,
+    rhs: &PreparedBrep,
+) -> (ContactWitness, BvhPairTraversalStats) {
     let mut best = ContactWitness {
         lhs_point: lhs
             .vertices
@@ -537,63 +587,84 @@ fn triangle_distance(lhs: &PreparedBrep, rhs: &PreparedBrep) -> ContactWitness {
         distance_sq: f64::INFINITY,
     };
 
-    for tri_lhs in &lhs.triangles {
-        for tri_rhs in &rhs.triangles {
-            if let Some(witness) = triangle_touch_witness(tri_lhs, tri_rhs, &lhs.bbox, &rhs.bbox) {
-                return witness;
-            }
-
-            for point in [tri_lhs.a, tri_lhs.b, tri_lhs.c] {
-                let closest = closest_point_on_triangle(point, tri_rhs);
-                update_best(
-                    &mut best,
-                    ContactWitness {
-                        lhs_point: point,
-                        rhs_point: closest,
-                        distance_sq: distance_sq(point, closest),
-                    },
+    let (_, stats) =
+        lhs.triangle_bvh
+            .visit_nearest_pairs(&rhs.triangle_bvh, f64::INFINITY, |lhs_id, rhs_id| {
+                let candidate = triangle_pair_distance(
+                    &lhs.triangles[lhs_id as usize],
+                    &rhs.triangles[rhs_id as usize],
+                    &lhs.bbox,
+                    &rhs.bbox,
                 );
-            }
+                update_best(&mut best, candidate);
+                candidate.distance_sq
+            });
 
-            for point in [tri_rhs.a, tri_rhs.b, tri_rhs.c] {
-                let closest = closest_point_on_triangle(point, tri_lhs);
-                update_best(
-                    &mut best,
-                    ContactWitness {
-                        lhs_point: closest,
-                        rhs_point: point,
-                        distance_sq: distance_sq(closest, point),
-                    },
-                );
-            }
+    (best, stats)
+}
 
-            let lhs_edges = [
-                (tri_lhs.a, tri_lhs.b),
-                (tri_lhs.b, tri_lhs.c),
-                (tri_lhs.c, tri_lhs.a),
-            ];
-            let rhs_edges = [
-                (tri_rhs.a, tri_rhs.b),
-                (tri_rhs.b, tri_rhs.c),
-                (tri_rhs.c, tri_rhs.a),
-            ];
-            for (lhs_start, lhs_end) in lhs_edges {
-                for (rhs_start, rhs_end) in rhs_edges {
-                    let (lhs_point, rhs_point, distance_sq) =
-                        closest_points_on_segments(lhs_start, lhs_end, rhs_start, rhs_end);
-                    update_best(
-                        &mut best,
-                        ContactWitness {
-                            lhs_point,
-                            rhs_point,
-                            distance_sq,
-                        },
-                    );
-                }
-            }
-        }
+fn triangle_pair_distance(
+    tri_lhs: &TriangleRecord,
+    tri_rhs: &TriangleRecord,
+    lhs_bbox: &BoundingBox,
+    rhs_bbox: &BoundingBox,
+) -> ContactWitness {
+    if let Some(witness) = triangle_touch_witness(tri_lhs, tri_rhs, lhs_bbox, rhs_bbox) {
+        return witness;
     }
 
+    let mut best = ContactWitness {
+        lhs_point: tri_lhs.a,
+        rhs_point: tri_rhs.a,
+        distance_sq: f64::INFINITY,
+    };
+    for point in [tri_lhs.a, tri_lhs.b, tri_lhs.c] {
+        let closest = closest_point_on_triangle(point, tri_rhs);
+        update_best(
+            &mut best,
+            ContactWitness {
+                lhs_point: point,
+                rhs_point: closest,
+                distance_sq: distance_sq(point, closest),
+            },
+        );
+    }
+    for point in [tri_rhs.a, tri_rhs.b, tri_rhs.c] {
+        let closest = closest_point_on_triangle(point, tri_lhs);
+        update_best(
+            &mut best,
+            ContactWitness {
+                lhs_point: closest,
+                rhs_point: point,
+                distance_sq: distance_sq(closest, point),
+            },
+        );
+    }
+
+    let lhs_edges = [
+        (tri_lhs.a, tri_lhs.b),
+        (tri_lhs.b, tri_lhs.c),
+        (tri_lhs.c, tri_lhs.a),
+    ];
+    let rhs_edges = [
+        (tri_rhs.a, tri_rhs.b),
+        (tri_rhs.b, tri_rhs.c),
+        (tri_rhs.c, tri_rhs.a),
+    ];
+    for (lhs_start, lhs_end) in lhs_edges {
+        for (rhs_start, rhs_end) in rhs_edges {
+            let (lhs_point, rhs_point, distance_sq) =
+                closest_points_on_segments(lhs_start, lhs_end, rhs_start, rhs_end);
+            update_best(
+                &mut best,
+                ContactWitness {
+                    lhs_point,
+                    rhs_point,
+                    distance_sq,
+                },
+            );
+        }
+    }
     best
 }
 
@@ -1208,6 +1279,11 @@ fn ensure_finite_report_pair(report: &BrepProximityReport) -> Result<(), JsValue
             "Proximity result rejected: non-finite pair report",
         ));
     }
+    if report.bvh_node_pair_tests == 0 || report.triangle_pair_tests == 0 {
+        return Err(js_error(
+            "Proximity result rejected: acceleration evidence is incomplete",
+        ));
+    }
     Ok(())
 }
 
@@ -1443,6 +1519,10 @@ mod tests {
         assert_eq!(report.accuracy, ProximityAccuracy::ExactPlanarBrep);
         assert_eq!(report.lhs_triangle_count, 12);
         assert_eq!(report.rhs_triangle_count, 12);
+        assert_eq!(report.acceleration, ProximityAcceleration::TriangleBvhV1);
+        assert!(report.bvh_node_pair_tests > 0);
+        assert!(report.triangle_pair_tests > 0);
+        assert!(report.triangle_pair_tests < 12 * 12);
         assert!((report.distance - 3.0).abs() < 1.0e-9);
         assert!((report.closest_point_lhs[0] - 1.0).abs() < 1.0e-9);
         assert!((report.closest_point_lhs[1] - 1.0).abs() < 1.0e-9);
