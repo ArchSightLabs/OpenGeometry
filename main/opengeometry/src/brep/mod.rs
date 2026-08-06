@@ -6,6 +6,7 @@ pub mod geometry;
 pub mod halfedge;
 pub mod r#loop;
 pub mod mass_properties;
+pub mod proximity;
 pub mod shell;
 pub mod validity;
 pub mod vertex;
