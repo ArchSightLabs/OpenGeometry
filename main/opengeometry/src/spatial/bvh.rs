@@ -334,6 +334,42 @@ impl Bvh3 {
         self.query(|candidate| candidate.intersects_aabb(bounds))
     }
 
+    pub fn query_ids_within_distance(
+        &self,
+        bounds: &Aabb3,
+        max_distance: f64,
+        max_results: usize,
+    ) -> Result<Vec<u32>, String> {
+        if !max_distance.is_finite() || max_distance < 0.0 {
+            return Err(
+                "Invalid spatial distance query: max distance must be finite and non-negative."
+                    .to_string(),
+            );
+        }
+        if max_results == 0 {
+            return Err(
+                "Invalid spatial distance query: max results must be greater than zero."
+                    .to_string(),
+            );
+        }
+        let max_distance_sq = max_distance * max_distance;
+        if !max_distance_sq.is_finite() {
+            return Err("Invalid spatial distance query: max distance is too large.".to_string());
+        }
+
+        let mut ids =
+            self.query(|candidate| bounds.distance_squared_to_aabb(candidate) <= max_distance_sq);
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.len() > max_results {
+            return Err(format!(
+                "Spatial distance query exceeded max results limit: {}.",
+                max_results
+            ));
+        }
+        Ok(ids)
+    }
+
     pub fn query_frustum(&self, frustum: &Frustum3) -> Vec<u32> {
         self.query(|candidate| candidate.intersects_frustum(frustum))
     }
@@ -650,6 +686,25 @@ impl OGSpatialIndex {
         let bounds = Aabb3::from_coords(min_x, min_y, min_z, max_x, max_y, max_z)
             .map_err(|err| JsValue::from_str(&err))?;
         Ok(self.bvh.query_aabb(&bounds))
+    }
+
+    #[wasm_bindgen(js_name = queryIdsWithinDistance)]
+    pub fn query_ids_within_distance(
+        &self,
+        min_x: f64,
+        min_y: f64,
+        min_z: f64,
+        max_x: f64,
+        max_y: f64,
+        max_z: f64,
+        max_distance: f64,
+        max_results: u32,
+    ) -> Result<Vec<u32>, JsValue> {
+        let bounds = Aabb3::from_coords(min_x, min_y, min_z, max_x, max_y, max_z)
+            .map_err(|err| JsValue::from_str(&err))?;
+        self.bvh
+            .query_ids_within_distance(&bounds, max_distance, max_results as usize)
+            .map_err(|err| JsValue::from_str(&err))
     }
 
     #[wasm_bindgen(js_name = queryPairIdsWithinDistance)]
@@ -1018,6 +1073,32 @@ mod tests {
         assert_eq!(left.distance_squared_to_aabb(&touching), 1.0);
         assert_eq!(left.distance_squared_to_aabb(&diagonal), 5.0);
         assert_eq!(left.distance_squared_to_aabb(&left), 0.0);
+    }
+
+    #[test]
+    fn bvh_distance_query_supports_one_anchored_review_scope() {
+        let bvh = Bvh3::build(vec![
+            box_primitive(7, (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)),
+            box_primitive(3, (1.1, 0.0, 0.0), (2.1, 1.0, 1.0)),
+            box_primitive(9, (1.1, 1.1, 0.0), (2.1, 2.1, 1.0)),
+            box_primitive(1, (5.0, 0.0, 0.0), (6.0, 1.0, 1.0)),
+        ]);
+        let anchor = Aabb3::from_coords(0.0, 0.0, 0.0, 1.0, 1.0, 1.0).expect("anchor");
+
+        assert_eq!(
+            bvh.query_ids_within_distance(&anchor, 0.15, 4)
+                .expect("bounded query"),
+            vec![3, 7, 9],
+        );
+        assert_eq!(
+            bvh.query_ids_within_distance(&anchor, 0.0, 4)
+                .expect("self query"),
+            vec![7],
+        );
+        assert!(bvh.query_ids_within_distance(&anchor, 0.15, 2).is_err());
+        assert!(bvh.query_ids_within_distance(&anchor, -1.0, 4).is_err());
+        assert!(bvh.query_ids_within_distance(&anchor, f64::NAN, 4).is_err());
+        assert!(bvh.query_ids_within_distance(&anchor, 0.15, 0).is_err());
     }
 
     #[test]
